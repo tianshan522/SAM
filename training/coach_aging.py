@@ -1,5 +1,7 @@
 import os
 import random
+import time
+from collections import defaultdict
 import matplotlib
 import matplotlib.pyplot as plt
 matplotlib.use('Agg')
@@ -47,6 +49,9 @@ class Coach:
 		# Initialize optimizer
 		self.optimizer = self.configure_optimizers()
 
+		# Mixed precision
+		self.scaler = torch.amp.GradScaler('cuda')
+
 		# Initialize dataset
 		self.train_dataset, self.test_dataset = self.configure_datasets()
 		self.train_dataloader = DataLoader(self.train_dataset,
@@ -79,37 +84,86 @@ class Coach:
 		return y_hat, latent
 
 	def __set_target_to_source(self, x, input_ages):
-		return [torch.cat((img, age * torch.ones((1, img.shape[1], img.shape[2])).to(self.device)))
+		return [torch.cat((img, torch.full((1, img.shape[1], img.shape[2]), float(age),
+				dtype=img.dtype, device=img.device)))
 				for img, age in zip(x, input_ages)]
+
+	def _print_profiling(self, prof, n):
+		total = sum(prof.values())
+		if total <= 0:
+			return
+		print(f'\n{"=" * 70}')
+		print(f'  PROFILING  last {n} steps  total {total:.2f}s  avg {total / n * 1000:.0f} ms/step')
+		print(f'{"=" * 70}')
+		labels = [
+			'data_fetch', 'to_device', 'extract_ages', 'age_transform',
+			'forward_real', 'loss_real', 'backward_real',
+			'forward_cycle', 'loss_cycle', 'backward_cycle',
+			'optim_step', 'logging',
+		]
+		for k in labels:
+			v = prof.get(k, 0.0)
+			pct = v / total * 100
+			bar = '#' * int(pct / 2)
+			print(f'  {k:20s} {v:8.3f}s  {pct:5.1f}%  {bar}')
+		print(f'  {"TOTAL":20s} {total:8.3f}s')
+		print(f'{"=" * 70}\n')
 
 	def train(self):
 		self.net.train()
+
+		_prof = defaultdict(float)
+		_prof_n = 0
+		_PROF_EVERY = 50
+		_prof_ts = time.time()
+		_train_start = time.time()
+
 		while self.global_step < self.opts.max_steps:
 			for batch_idx, batch in enumerate(self.train_dataloader):
+				torch.cuda.synchronize()
+				_tp = time.time()
+				_prof['data_fetch'] += _tp - _prof_ts
+
 				x, y = batch
 				x, y = x.to(self.device).float(), y.to(self.device).float()
 				self.optimizer.zero_grad()
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['to_device'] += _tn - _tp; _tp = _tn
 
-				input_ages = self.aging_loss.extract_ages(x) / 100.
+				with torch.amp.autocast('cuda'):
+					input_ages = self.aging_loss.extract_ages(x) / 100.
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['extract_ages'] += _tn - _tp; _tp = _tn
 
 				# perform no aging in 33% of the time
 				no_aging = random.random() <= (1. / 3)
 				if no_aging:
 					x_input = self.__set_target_to_source(x=x, input_ages=input_ages)
 				else:
-					x_input = [self.age_transformer(img.cpu()).to(self.device) for img in x]
-
+					x_input = [self.age_transformer(img) for img in x]
 				x_input = torch.stack(x_input)
 				target_ages = x_input[:, -1, 0, 0]
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['age_transform'] += _tn - _tp; _tp = _tn
 
 				# perform forward/backward pass on real images
-				y_hat, latent = self.perform_forward_pass(x_input)
-				loss, loss_dict, id_logs = self.calc_loss(x, y, y_hat, latent,
-														  target_ages=target_ages,
-														  input_ages=input_ages,
-														  no_aging=no_aging,
-														  data_type="real")
-				loss.backward()
+				with torch.amp.autocast('cuda'):
+					y_hat, latent = self.perform_forward_pass(x_input)
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['forward_real'] += _tn - _tp; _tp = _tn
+
+				with torch.amp.autocast('cuda'):
+					loss, loss_dict, id_logs = self.calc_loss(x, y, y_hat, latent,
+															  target_ages=target_ages,
+															  input_ages=input_ages,
+															  no_aging=no_aging,
+															  data_type="real")
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['loss_real'] += _tn - _tp; _tp = _tn
+
+				self.scaler.scale(loss).backward()
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['backward_real'] += _tn - _tp; _tp = _tn
 
 				# perform cycle on generate images by setting the target ages to the original input ages
 				y_hat_clone = y_hat.clone().detach().requires_grad_(True)
@@ -117,14 +171,28 @@ class Coach:
 				y_hat_inverse = self.__set_target_to_source(x=y_hat_clone, input_ages=input_ages_clone)
 				y_hat_inverse = torch.stack(y_hat_inverse)
 				reverse_target_ages = y_hat_inverse[:, -1, 0, 0]
-				y_recovered, latent_cycle = self.perform_forward_pass(y_hat_inverse)
-				loss, cycle_loss_dict, cycle_id_logs = self.calc_loss(x, y, y_recovered, latent_cycle,
-																	  target_ages=reverse_target_ages,
-																	  input_ages=input_ages,
-																	  no_aging=no_aging,
-																	  data_type="cycle")
-				loss.backward()
-				self.optimizer.step()
+				with torch.amp.autocast('cuda'):
+					y_recovered, latent_cycle = self.perform_forward_pass(y_hat_inverse)
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['forward_cycle'] += _tn - _tp; _tp = _tn
+
+				with torch.amp.autocast('cuda'):
+					loss, cycle_loss_dict, cycle_id_logs = self.calc_loss(x, y, y_recovered, latent_cycle,
+																		  target_ages=reverse_target_ages,
+																		  input_ages=input_ages,
+																		  no_aging=no_aging,
+																		  data_type="cycle")
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['loss_cycle'] += _tn - _tp; _tp = _tn
+
+				self.scaler.scale(loss).backward()
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['backward_cycle'] += _tn - _tp; _tp = _tn
+
+				self.scaler.step(self.optimizer)
+				self.scaler.update()
+				torch.cuda.synchronize()
+				_tn = time.time(); _prof['optim_step'] += _tn - _tp; _tp = _tn
 
 				# combine the logs of both forwards
 				for idx, cycle_log in enumerate(cycle_id_logs):
@@ -138,9 +206,28 @@ class Coach:
 					self.parse_and_log_images(id_logs, x, y, y_hat, y_recovered,
 											  title='images/train/faces')
 
-				if self.global_step % self.opts.board_interval == 0:
-					self.print_metrics(loss_dict, prefix='train')
-					self.log_metrics(loss_dict, prefix='train')
+			if self.global_step % self.opts.board_interval == 0:
+				elapsed = time.time() - _train_start
+				hrs, rem = divmod(int(elapsed), 3600)
+				mins, secs = divmod(rem, 60)
+				print(
+					f'[step {self.global_step:>6d}/{self.opts.max_steps}'
+					f' | {hrs:02d}:{mins:02d}:{secs:02d}]'
+					f'  loss={loss_dict.get("loss", 0):.4f}'
+					f'  aging={loss_dict.get("loss_aging_real", 0):.4f}'
+					f'  id={loss_dict.get("loss_id_real", 0):.4f}'
+					f'  l2={loss_dict.get("loss_l2_real", 0):.4f}',
+					flush=True,
+				)
+				self.print_metrics(loss_dict, prefix='train')
+				self.log_metrics(loss_dict, prefix='train')
+				_tn = time.time(); _prof['logging'] += _tn - _tp; _tp = _tn
+
+				# Profiling report
+				_prof_n += 1
+				if _prof_n % _PROF_EVERY == 0:
+					self._print_profiling(_prof, _PROF_EVERY)
+					_prof.clear()
 
 				# Validation related
 				val_loss_dict = None
@@ -161,13 +248,18 @@ class Coach:
 					break
 
 				self.global_step += 1
+				_prof_ts = time.time()
+
+		_remaining = _prof_n % _PROF_EVERY
+		if _remaining > 0:
+			self._print_profiling(_prof, _remaining)
 
 	def validate(self):
 		self.net.eval()
 		agg_loss_dict = []
 		for batch_idx, batch in enumerate(self.test_dataloader):
 			x, y = batch
-			with torch.no_grad():
+			with torch.no_grad(), torch.amp.autocast('cuda'):
 				x, y = x.to(self.device).float(), y.to(self.device).float()
 
 				input_ages = self.aging_loss.extract_ages(x) / 100.
@@ -177,7 +269,7 @@ class Coach:
 				if no_aging:
 					x_input = self.__set_target_to_source(x=x, input_ages=input_ages)
 				else:
-					x_input = [self.age_transformer(img.cpu()).to(self.device) for img in x]
+					x_input = [self.age_transformer(img) for img in x]
 
 				x_input = torch.stack(x_input)
 				target_ages = x_input[:, -1, 0, 0]
@@ -327,6 +419,7 @@ class Coach:
 			print(f'\t{key} = ', value)
 
 	def parse_and_log_images(self, id_logs, x, y, y_hat, y_recovered, title, subscript=None, display_count=2):
+		display_count = min(display_count, x.shape[0])
 		im_data = []
 		for i in range(display_count):
 			cur_im_data = {

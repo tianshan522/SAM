@@ -1,3 +1,5 @@
+import time
+
 from torch.utils.data import Dataset
 from PIL import Image
 from utils import data_utils
@@ -11,17 +13,26 @@ class ImagesDataset(Dataset):
 		self.source_transform = source_transform
 		self.target_transform = target_transform
 		self.opts = opts
+		self._prof_io = 0.0
+		self._prof_transform = 0.0
+		self._prof_count = 0
+		self._PROF_EVERY = 200
 
 	def __len__(self):
 		return len(self.source_paths)
 
 	def __getitem__(self, index):
+		t0 = time.time()
+
 		from_path = self.source_paths[index]
 		from_im = Image.open(from_path)
 		from_im = from_im.convert('RGB') if self.opts.label_nc == 0 else from_im.convert('L')
 
 		to_path = self.target_paths[index]
 		to_im = Image.open(to_path).convert('RGB')
+
+		t1 = time.time()
+
 		if self.target_transform:
 			to_im = self.target_transform(to_im)
 
@@ -29,5 +40,17 @@ class ImagesDataset(Dataset):
 			from_im = self.source_transform(from_im)
 		else:
 			from_im = to_im
+
+		t2 = time.time()
+
+		self._prof_io += t1 - t0
+		self._prof_transform += t2 - t1
+		self._prof_count += 1
+		if self._prof_count % self._PROF_EVERY == 0:
+			avg_io = self._prof_io / self._prof_count * 1000
+			avg_tf = self._prof_transform / self._prof_count * 1000
+			print(f'[Dataset] {self._prof_count} samples  '
+				  f'avg: PIL_decode={avg_io:.1f}ms  transform={avg_tf:.1f}ms  '
+				  f'total={avg_io + avg_tf:.1f}ms/sample')
 
 		return from_im, to_im
