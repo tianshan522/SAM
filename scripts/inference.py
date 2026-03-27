@@ -21,6 +21,7 @@ from models.psp import pSp
 
 def run():
 	test_opts = TestOptions().parse()
+	device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 	out_path_results = os.path.join(test_opts.exp_dir, 'inference_results')
 	out_path_coupled = os.path.join(test_opts.exp_dir, 'inference_coupled')
@@ -31,11 +32,12 @@ def run():
 	ckpt = torch.load(test_opts.checkpoint_path, map_location='cpu')
 	opts = ckpt['opts']
 	opts.update(vars(test_opts))
+	opts['device'] = device
 	opts = Namespace(**opts)
 
 	net = pSp(opts)
 	net.eval()
-	net.cuda()
+	net.to(device)
 
 	age_transformers = [AgeTransformer(target_age=age) for age in opts.target_age.split(',')]
 
@@ -62,9 +64,9 @@ def run():
 			if global_i >= opts.n_images:
 				break
 			with torch.no_grad():
-				input_age_batch = [age_transformer(img.cpu()).to('cuda') for img in input_batch]
+				input_age_batch = [age_transformer(img.cpu()).to(device) for img in input_batch]
 				input_age_batch = torch.stack(input_age_batch)
-				input_cuda = input_age_batch.cuda().float()
+				input_cuda = input_age_batch.to(device).float()
 				tic = time.time()
 				result_batch = run_on_batch(input_cuda, net, opts)
 				toc = time.time()
@@ -76,9 +78,9 @@ def run():
 
 					if opts.couple_outputs or global_i % 100 == 0:
 						input_im = log_image(input_batch[i], opts)
-						resize_amount = (256, 256) if opts.resize_outputs else (1024, 1024)
-						res = np.concatenate([np.array(input_im.resize(resize_amount)),
-											  np.array(result.resize(resize_amount))], axis=1)
+						coupled_resize = (256, 256) if opts.resize_outputs else (1024, 1024)
+						res = np.concatenate([np.array(input_im.resize(coupled_resize)),
+											  np.array(result.resize(coupled_resize))], axis=1)
 						age_out_path_coupled = os.path.join(out_path_coupled, age_transformer.target_age)
 						os.makedirs(age_out_path_coupled, exist_ok=True)
 						Image.fromarray(res).save(os.path.join(age_out_path_coupled, os.path.basename(im_path)))
@@ -87,7 +89,8 @@ def run():
 					os.makedirs(age_out_path_results, exist_ok=True)
 					image_name = os.path.basename(im_path)
 					im_save_path = os.path.join(age_out_path_results, image_name)
-					Image.fromarray(np.array(result.resize(resize_amount))).save(im_save_path)
+					output_resize = (256, 256) if opts.resize_outputs else (1024, 1024)
+					Image.fromarray(np.array(result.resize(output_resize))).save(im_save_path)
 					global_i += 1
 
 	stats_path = os.path.join(opts.exp_dir, 'stats.txt')
