@@ -82,7 +82,7 @@ class Blur(nn.Module):
         self.pad = pad
 
     def forward(self, input):
-        out = upfirdn2d(input, self.kernel, pad=self.pad)
+        out = upfirdn2d(input, self.kernel.to(input.dtype), pad=self.pad)
 
         return out
 
