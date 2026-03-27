@@ -2,3 +2,12 @@
 .DS_Store
 pretrained_models/
 shape_predictor_68_face_landmarks.dat
+workspace/
+experiments/
+artifacts/
+__pycache__/
+.conda/
+workspace/datasets/humans_aligned/*
+
+# 用户私有配置（账密），不提交
+scripts/local/dlp_config.py
