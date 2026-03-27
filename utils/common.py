@@ -1,3 +1,10 @@
+import os
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_MPLCONFIGDIR = os.path.join(_REPO_ROOT, "workspace", ".cache", "matplotlib")
+os.makedirs(_MPLCONFIGDIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", _MPLCONFIGDIR)
+
 from PIL import Image
 import matplotlib.pyplot as plt
 
